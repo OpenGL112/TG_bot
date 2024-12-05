@@ -208,7 +208,7 @@ async def my_bookings(message: types.Message):
 @dp.message(Command("cancel_bookings"))
 async def cancel_bookings(message: types.Message):
     user_id = message.from_user.id
-
+    counter = 0
     # Получаем последние бронирования пользователя
     last_bookings = await db.get_last_bookings(user_id, limit=3)
     d = datetime.today()
@@ -227,6 +227,7 @@ async def cancel_bookings(message: types.Message):
 
         if booking_date >= d.date():  # Проверяем, актуально ли бронирование
             has_active_bookings = True
+            counter += 1
             response += (
                 f"Услуга: {booking[0]}\n"  # service
                 f"Дата: {booking[1]}\n"  # date
@@ -238,7 +239,6 @@ async def cancel_bookings(message: types.Message):
         await message.answer(response)
     else:
         await message.answer("У вас нет активных бронирований.")
-
 
 # Завершение бронирования
 @dp.callback_query(F.data.startswith("slot_"))
