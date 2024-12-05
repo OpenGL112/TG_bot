@@ -204,6 +204,42 @@ async def my_bookings(message: types.Message):
     await message.answer(response)
 
 
+# Команда /cancel_bookings
+@dp.message(Command("cancel_bookings"))
+async def cancel_bookings(message: types.Message):
+    user_id = message.from_user.id
+
+    # Получаем последние бронирования пользователя
+    last_bookings = await db.get_last_bookings(user_id, limit=3)
+    d = datetime.today()
+
+    # Если бронирований нет
+    if not last_bookings:
+        await message.answer("У вас нет активных бронирований.")
+        return
+
+    # Формируем ответ
+    response = "Какое бронирование Вы хотите отменить?:\n\n"
+    has_active_bookings = False  # Флаг для проверки наличия активных бронирований
+
+    for booking in last_bookings:
+        booking_date = datetime.strptime(booking[1], '%Y-%m-%d').date()
+
+        if booking_date >= d.date():  # Проверяем, актуально ли бронирование
+            has_active_bookings = True
+            response += (
+                f"Услуга: {booking[0]}\n"  # service
+                f"Дата: {booking[1]}\n"  # date
+                f"Время: {booking[2]}\n\n"  # time
+            )
+
+    # Если есть активные бронирования, отправляем список
+    if has_active_bookings:
+        await message.answer(response)
+    else:
+        await message.answer("У вас нет активных бронирований.")
+
+
 # Завершение бронирования
 @dp.callback_query(F.data.startswith("slot_"))
 async def handle_time_and_finish(callback_query: types.CallbackQuery, state: FSMContext):

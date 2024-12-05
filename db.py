@@ -100,3 +100,25 @@ async def get_last_bookings(user_id: int, limit: int = 3):
         async with db.execute(query, (user_id, limit)) as cursor:
             rows = await cursor.fetchall()
             return rows
+
+# Функция для отмены брони слота
+async def cancel_slot(slot_id, user_id):
+    async with aiosqlite.connect(DATABASE) as db:
+        # Получаем информацию о слоте
+        async with db.execute("""
+            SELECT service, date, time FROM slots WHERE id = ?
+        """, (slot_id,)) as cursor:
+            slot = await cursor.fetchone()
+
+        if slot:
+            service, date, time = slot
+            # Добавляем запись в таблицу бронирований
+            await db.execute("""
+                INSERT INTO bookings (user_id, service, date, time) 
+                VALUES (?, ?, ?, ?)
+            """, (user_id, service, date, time))
+            # Помечаем слот как забронированный
+            await db.execute("""
+                UPDATE slots SET is_booked = TRUE WHERE id = ?
+            """, (slot_id,))
+            await db.commit()
