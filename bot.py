@@ -286,19 +286,23 @@ async def handle_time_and_finish(callback_query: types.CallbackQuery, state: FSM
     await db.book_slot(slot_id, user_id)  # Вызываем функцию бронирования
 
     data = await state.get_data()
-    service = data["service"]
+    service = data["refinement"]
     date = data["date"]
-
     # Ответ пользователю
     await callback_query.message.answer(
         f"Вы успешно записаны на услугу: {service}\nДата: {date}\nСпасибо!"
     )
 
+    # Ссылка на профиль
+    link = f'<a href="tg://user?id={user_id}">Заказчик</a>'
+
     # Уведомление администратору
     await bot.send_message(
         ADMIN_ID,
         f"Новая запись:\nУслуга: {service}\nДата: {date}\nПользователь: {callback_query.from_user.full_name}"
+        f"\nСсылка на профиль: {link}", parse_mode="HTML"
     )
+
 
     await state.clear()
     await show_start_menu(callback_query, state)
