@@ -223,8 +223,6 @@ async def show_help(message: types.Message):
 # Команда /my_bookings
 @dp.message(Command("my_bookings"))
 async def my_bookings(message: types.Message, user_id):
-    print(user_id)
-    print('=3')
 
     last_bookings = await db.get_last_bookings(user_id, limit=3)
 
@@ -247,10 +245,7 @@ async def my_bookings(message: types.Message, user_id):
 # Команда /cancel_bookings
 @dp.message(Command("cancel_bookings"))
 async def cancel_bookings(message: types.Message, user_id):
-    print(user_id)
-    print('=22')
-#    user_id = message.from_user.id
-#    print (user_id)
+
     counter = 0
     # Получаем последние бронирования пользователя
     last_bookings = await db.get_last_bookings(user_id, limit=3)
