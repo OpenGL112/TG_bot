@@ -90,35 +90,47 @@ async def book_slot(slot_id, user_id):
 # Функция для получения последних бронирований пользователя
 async def get_last_bookings(user_id: int, limit: int = 3):
     query = """
-    SELECT service, date, time
-    FROM bookings
-    WHERE user_id = ?
-    ORDER BY date DESC, time DESC
-    LIMIT ?
+    SELECT service, date, time, id FROM bookings WHERE user_id = ? ORDER BY date DESC, time DESC LIMIT ?
     """
     async with aiosqlite.connect(DATABASE) as db:
         async with db.execute(query, (user_id, limit)) as cursor:
             rows = await cursor.fetchall()
             return rows
 
+
 # Функция для отмены брони слота
 async def cancel_slot(slot_id, user_id):
     async with aiosqlite.connect(DATABASE) as db:
+        print(slot_id)
         # Получаем информацию о слоте
         async with db.execute("""
-            SELECT service, date, time FROM slots WHERE id = ?
+            SELECT service, date, time FROM bookings WHERE id = ?
         """, (slot_id,)) as cursor:
             slot = await cursor.fetchone()
+        await db.execute("""
+            DELETE FROM bookings WHERE id = ?
+                    """, (slot_id,))
+        await db.commit()
 
         if slot:
-            service, date, time = slot
-            # Добавляем запись в таблицу бронирований
-            await db.execute("""
-                INSERT INTO bookings (user_id, service, date, time) 
-                VALUES (?, ?, ?, ?)
-            """, (user_id, service, date, time))
-            # Помечаем слот как забронированный
-            await db.execute("""
-                UPDATE slots SET is_booked = TRUE WHERE id = ?
-            """, (slot_id,))
-            await db.commit()
+            # Получаем ID слота из таблицы slots
+            async with db.execute("""
+                SELECT id FROM slots WHERE service = ? AND date = ? AND time = ?
+            """, (slot[0], slot[1], slot[2])) as cursor:  # передаем отдельные элементы
+                slot_result = await cursor.fetchone()  # Получаем ID слота для изменений
+                print(slot_result)
+
+            if slot_result:
+                # Обновляем слот
+                await db.execute("""
+                    UPDATE slots SET is_booked = False WHERE id = ?
+                """, (slot_result[0],))  # Используем slot_result[0] для получения ID слота
+                await db.commit()
+                print("Слот успешно отменен.")
+                return "Слот успешно отменен"
+            else:
+                print("Слот не найден.")
+                return "Слот не найден"
+        else:
+            print("Бронирование не найдено.")
+            return "Бронирование не найдено"

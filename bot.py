@@ -1,4 +1,5 @@
-from email.message import Message
+from email import message
+from http.client import responses
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.filters import Command
@@ -9,7 +10,7 @@ from datetime import datetime
 from calendar import monthcalendar, month_name
 from dotenv import load_dotenv
 import asyncio
-import db
+import db, re
 from db import cancel_slot
 
 load_dotenv()
@@ -230,7 +231,7 @@ async def my_bookings(message: types.Message, user_id):
         await message.answer("У вас нет недавних бронирований.")
         return
 
-    response = "Ваши последние бронирования:\n\n"
+    response = "Ваши бронирования:\n\n"
     for booking in last_bookings:
         # Обращаемся к элементам через индексы, если это кортеж
         response += (
@@ -257,7 +258,8 @@ async def cancel_bookings(message: types.Message, user_id):
         return
 
     # Формируем ответ
-    response = "Какое бронирование Вы хотите отменить?:\n\n"
+    responses = []
+    slot_response_id = []
     has_active_bookings = False  # Флаг для проверки наличия активных бронирований
 
     for booking in last_bookings:
@@ -266,17 +268,32 @@ async def cancel_bookings(message: types.Message, user_id):
         if booking_date >= d.date():  # Проверяем, актуально ли бронирование
             has_active_bookings = True
             counter += 1
-            response += (
+            responses += [
                 f"Услуга: {booking[0]}\n"  # service
                 f"Дата: {booking[1]}\n"  # date
-                f"Время: {booking[2]}\n\n"  # time
-            )
+                f"Время: {booking[2]}\n"  # time
+            ]
+            slot_response_id += [booking[3]] # ID
 
     # Если есть активные бронирования, отправляем список
     if has_active_bookings:
-        await message.answer(response)
+        t = 0
+        await message.answer(text = 'Какое бронирование Вы хотите отменить?\n\n')
+        for response in responses:
+            cancel_list = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text='Отмена', callback_data=f"db_cancel_booking_{slot_response_id[t]}")]])
+            t+=1
+            await message.answer(text=response, reply_markup=cancel_list)
     else:
         await message.answer("У вас нет активных бронирований.")
+
+#Отмена бронирования
+@dp.callback_query(F.data.startswith("db_cancel_booking"))
+async def handle_db_cancel_booking (callback_query: types.CallbackQuery, state: FSMContext):
+    slot_id = callback_query.data[len("db_cancel_booking_"):]  # Получаем строку с метаданными
+    user_id = callback_query.from_user.id
+    final = await db.cancel_slot(slot_id, user_id)
+    await callback_query.message.answer(final)
 
 # Завершение бронирования
 @dp.callback_query(F.data.startswith("slot_"))
