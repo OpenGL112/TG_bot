@@ -294,6 +294,7 @@ async def handle_db_cancel_booking (callback_query: types.CallbackQuery, state: 
     user_id = callback_query.from_user.id
     final = await db.cancel_slot(slot_id, user_id)
     await callback_query.message.answer(final)
+    await show_start_menu(callback_query, state)
 
 # Завершение бронирования
 @dp.callback_query(F.data.startswith("slot_"))

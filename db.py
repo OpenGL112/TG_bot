@@ -118,7 +118,6 @@ async def cancel_slot(slot_id, user_id):
                 SELECT id FROM slots WHERE service = ? AND date = ? AND time = ?
             """, (slot[0], slot[1], slot[2])) as cursor:  # передаем отдельные элементы
                 slot_result = await cursor.fetchone()  # Получаем ID слота для изменений
-                print(slot_result)
 
             if slot_result:
                 # Обновляем слот
@@ -126,11 +125,8 @@ async def cancel_slot(slot_id, user_id):
                     UPDATE slots SET is_booked = False WHERE id = ?
                 """, (slot_result[0],))  # Используем slot_result[0] для получения ID слота
                 await db.commit()
-                print("Слот успешно отменен.")
                 return "Слот успешно отменен"
             else:
-                print("Слот не найден.")
                 return "Слот не найден"
         else:
-            print("Бронирование не найдено.")
             return "Бронирование не найдено"
