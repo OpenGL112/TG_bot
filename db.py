@@ -85,6 +85,7 @@ async def book_slot(slot_id, user_id):
                 UPDATE slots SET is_booked = TRUE WHERE id = ?
             """, (slot_id,))
             await db.commit()
+            return time
 
 
 # Функция для получения последних бронирований пользователя

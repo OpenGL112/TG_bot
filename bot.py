@@ -301,14 +301,15 @@ async def handle_db_cancel_booking (callback_query: types.CallbackQuery, state: 
 async def handle_time_and_finish(callback_query: types.CallbackQuery, state: FSMContext):
     slot_id = int(callback_query.data.split("_")[1])
     user_id = callback_query.from_user.id  # Получаем user_id из callback_query
-    await db.book_slot(slot_id, user_id)  # Вызываем функцию бронирования
+    slot_time = await db.book_slot(slot_id, user_id)  # Вызываем функцию бронирования
 
     data = await state.get_data()
     service = data["refinement"]
     date = data["date"]
+
     # Ответ пользователю
     await callback_query.message.answer(
-        f"Вы успешно записаны на услугу: {service}\nДата: {date}\nСпасибо!"
+        f"Вы успешно записаны на услугу: {service}\nДата: {date}\nВремя: {slot_time}\nСпасибо!"
     )
 
     # Ссылка на профиль
@@ -317,7 +318,8 @@ async def handle_time_and_finish(callback_query: types.CallbackQuery, state: FSM
     # Уведомление администратору
     await bot.send_message(
         ADMIN_ID,
-        f"Новая запись:\nУслуга: {service}\nДата: {date}\nПользователь: {callback_query.from_user.full_name}"
+        f"Новая запись:\nУслуга: {service}\nДата: {date}\nВремя: {slot_time}\n"
+        f"Пользователь: {callback_query.from_user.full_name}"
         f"\nСсылка на профиль: {link}", parse_mode="HTML"
     )
 
