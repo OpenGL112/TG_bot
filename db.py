@@ -246,3 +246,50 @@ async def cancel_booking(booking_id: int, user_id: int) -> dict | None:
         raise
     finally:
         await conn.close()
+
+
+async def get_next_free_dates(service: str, now: datetime, limit: int = 6) -> list[str]:
+    """Ближайшие даты (ISO), на которые у услуги есть свободное время."""
+    conn = await _connect()
+    try:
+        async with conn.execute(
+            """
+            SELECT DISTINCT date FROM slots
+            WHERE service = ? AND is_booked = 0
+              AND (date > ? OR (date = ? AND time > ?))
+            ORDER BY date LIMIT ?
+            """,
+            (service, now.date().isoformat(), now.date().isoformat(), now.strftime("%H:%M"), limit),
+        ) as cur:
+            return [row[0] for row in await cur.fetchall()]
+    finally:
+        await conn.close()
+
+
+async def get_slot(slot_id: int) -> dict | None:
+    """Данные слота по id."""
+    conn = await _connect()
+    try:
+        async with conn.execute(
+            "SELECT service, date, time, is_booked FROM slots WHERE id = ?", (slot_id,)
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return {"service": row[0], "date": row[1], "time": row[2], "is_booked": bool(row[3])}
+    finally:
+        await conn.close()
+
+
+async def get_booking(booking_id: int, user_id: int) -> dict | None:
+    """Запись пользователя по id (чужие записи не возвращаются)."""
+    conn = await _connect()
+    try:
+        async with conn.execute(
+            "SELECT service, date, time FROM bookings WHERE id = ? AND user_id = ?",
+            (booking_id, user_id),
+        ) as cur:
+            row = await cur.fetchone()
+        return {"service": row[0], "date": row[1], "time": row[2]} if row else None
+    finally:
+        await conn.close()
