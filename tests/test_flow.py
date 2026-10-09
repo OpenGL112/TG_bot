@@ -1,6 +1,6 @@
 """Сквозной сценарий бота через Dispatcher с фейковой сессией Telegram."""
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 os.environ["BOT_TOKEN"] = os.environ.get("BOT_TOKEN") or "123456:TEST-TOKEN-TEST-TOKEN-TEST-TOKEN-TES"
 os.environ["ADMIN_ID"] = os.environ.get("ADMIN_ID") or "999"
@@ -82,14 +82,16 @@ class Harness:
 async def h(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "DATABASE", str(tmp_path / "flow.db"))
     # фиксируем «сейчас» на 10:00 сегодняшнего дня, чтобы тест не зависел от часа запуска
-    fixed_now = app.now_local().replace(hour=10, minute=0, second=0, microsecond=0)
-    monkeypatch.setattr(app, "now_local", lambda: fixed_now)
+    clock = [app.now_local().replace(hour=10, minute=0, second=0, microsecond=0)]
+    monkeypatch.setattr(app, "now_local", lambda: clock[0])
     await db.init_db()
     await app.refresh_slots()
     session = FakeSession()
     monkeypatch.setattr(app.bot, "session", session)
     await app.dp.storage.close()
-    return Harness(session)
+    harness = Harness(session)
+    harness.clock = clock
+    return harness
 
 
 def texts(sent):
@@ -175,3 +177,90 @@ async def test_each_press_answered_once(h):
         await h.press(data)
         answers = [c for c in h.session.calls if isinstance(c, AnswerCallbackQuery)]
         assert len(answers) == 1, data
+
+
+async def book_via_buttons(h, days_ahead=2):
+    """Записывается через кнопки на день через days_ahead дней, возвращает (дата, время)."""
+    await h.text(app.BTN_BOOK)
+    await h.press(h.find("svc:"))
+    target = (h.clock[0] + timedelta(days=days_ahead)).date().isoformat()
+    await h.press(f"day:{target}")
+    await h.press(h.find("slot:"))
+    await h.press("confirm")
+    booking = (await db.get_upcoming_bookings(USER.id, h.clock[0]))[0]
+    return datetime.strptime(f"{booking[1]} {booking[2]}", "%Y-%m-%d %H:%M")
+
+
+def sent_to_user(h):
+    return [c for c in h.session.calls if isinstance(c, SendMessage) and c.chat_id == USER.id]
+
+
+async def test_reminders_end_to_end(h):
+    start = await book_via_buttons(h)
+
+    async def tick(at):
+        h.clock[0] = at
+        h.session.calls.clear()
+        await app.send_due_reminders(at)
+        return sent_to_user(h)
+
+    assert await tick(start - timedelta(hours=25)) == []
+
+    out = await tick(start - timedelta(hours=24))
+    assert len(out) == 1 and "Напоминание" in out[0].text
+    callbacks = [b.callback_data for row in out[0].reply_markup.inline_keyboard for b in row]
+    assert any(c.startswith("rok:") for c in callbacks) and any(c.startswith("bc:") for c in callbacks)
+    assert await tick(start - timedelta(hours=23)) == []      # не повторяется
+
+    rok = next(c for c in callbacks if c.startswith("rok:"))
+    res = await h.press(rok)
+    assert "ждём вас" in texts(res)
+
+    out = await tick(start - timedelta(hours=3))
+    assert len(out) == 1 and out[0].reply_markup is None       # в день визита — без кнопок
+    out = await tick(start - timedelta(hours=1))
+    assert len(out) == 1 and out[0].reply_markup is None
+    assert await tick(start - timedelta(minutes=30)) == []
+
+
+async def test_cancel_from_day_before_reminder(h):
+    start = await book_via_buttons(h)
+    h.clock[0] = start - timedelta(hours=24)
+    h.session.calls.clear()
+    await app.send_due_reminders(h.clock[0])
+    markup = sent_to_user(h)[0].reply_markup
+    bc = next(b.callback_data for row in markup.inline_keyboard for b in row if b.callback_data.startswith("bc:"))
+
+    out = await h.press(bc)
+    assert "Точно отменить" in texts(out)
+    await h.press(h.find("bcy:"))
+    assert await db.get_upcoming_bookings(USER.id, h.clock[0]) == []
+
+    h.session.calls.clear()
+    await app.send_due_reminders(start - timedelta(hours=3))   # отменённой записи не напоминаем
+    assert sent_to_user(h) == []
+
+
+async def test_blocked_user_does_not_retry(h, monkeypatch):
+    from aiogram.exceptions import TelegramForbiddenError
+    start = await book_via_buttons(h)
+    calls = []
+
+    async def blocked(*args, **kwargs):
+        calls.append(1)
+        raise TelegramForbiddenError(method=None, message="bot was blocked by the user")
+
+    monkeypatch.setattr(app.bot, "send_message", blocked)
+    await app.send_due_reminders(start - timedelta(hours=24))
+    await app.send_due_reminders(start - timedelta(hours=23))
+    assert len(calls) == 1
+
+
+async def test_booking_message_mentions_reminders(h):
+    await h.text(app.BTN_BOOK)
+    await h.press(h.find("svc:"))
+    target = (h.clock[0] + timedelta(days=3)).date().isoformat()
+    await h.press(f"day:{target}")
+    await h.press(h.find("slot:"))
+    out = await h.press("confirm")
+    assert "за день, за 3 часа и за час" in texts(out)

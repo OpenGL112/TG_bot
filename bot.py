@@ -12,6 +12,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.exceptions import TelegramForbiddenError, TelegramNotFound
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,6 +27,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import db
+import reminders
 
 load_dotenv()
 
@@ -398,13 +400,17 @@ async def on_confirm(callback: types.CallbackQuery, state: FSMContext):
         return
     await callback.answer("Готово!")
     await state.clear()
+    start = datetime.strptime(f"{booking['date']} {booking['time']}", "%Y-%m-%d %H:%M")
+    phrase = reminders.upcoming_phrase(start, now_local())
+    remind = f"Мы напомним о визите {phrase}.\n" if phrase else ""
     await show(
         callback,
         "✅ <b>Вы записаны!</b>\n\n"
         f"{service_label(booking['service'])}\n"
         f"🗓 {human_date(booking['date'])}\n"
         f"🕐 {booking['time']}\n\n"
-        f"Ждём вас! Посмотреть или отменить запись можно кнопками «{BTN_MY}» и «{BTN_CANCEL}».",
+        f"Ждём вас! {remind}"
+        f"Посмотреть или отменить запись можно кнопками «{BTN_MY}» и «{BTN_CANCEL}».",
         inline([btn("📅 Записаться ещё", "book")]),
     )
     await notify_admin("Новая запись", booking, callback.from_user)
@@ -529,6 +535,84 @@ async def on_close(callback: types.CallbackQuery):
     await show(callback, "Хорошо, ничего не меняем. Выберите действие кнопками внизу 👇")
 
 
+# ---------------------------------------------------------------- напоминания
+REMINDER_CHECK_SECONDS = 60
+
+
+def reminder_text(reminder: reminders.Reminder, booking: dict) -> str:
+    when = human_date(booking["date"]).split(",")[0]  # «Завтра» / «Сегодня» / «Пн 12.10»
+    lines = ["🔔 <b>Напоминание о записи</b>", ""]
+    if reminder.can_cancel:
+        lines.append(f"{when} в <b>{booking['time']}</b> у вас запись:")
+    else:
+        lines.append(f"Сегодня в <b>{booking['time']}</b> ждём вас:")
+    lines += [service_label(booking["service"]), f"🗓 {human_date(booking['date'])}, 🕐 {booking['time']}"]
+    if SALON_ADDRESS:
+        lines.append(f"📍 {html.escape(SALON_ADDRESS)}")
+    if reminder.can_cancel:
+        lines += ["", "Всё в силе? Если планы изменились, пожалуйста, отмените запись — "
+                      "время освободится для других."]
+    return "\n".join(lines)
+
+
+async def send_due_reminders(now: datetime) -> int:
+    """Отправляет напоминания, время которых пришло. Возвращает число отправленных."""
+    horizon = max(r.before for r in reminders.REMINDERS)
+    sent_count = 0
+    for booking in await db.get_bookings_for_reminders(now, horizon):
+        reminder, to_mark = reminders.plan(booking["start"], booking["created_at"], now, booking["sent"])
+        if reminder is not None:
+            markup = None
+            if reminder.can_cancel:
+                markup = inline([btn("✅ Приду", f"rok:{booking['id']}")],
+                                [btn("❌ Отменить запись", f"bc:{booking['id']}")])
+            try:
+                await bot.send_message(booking["user_id"], reminder_text(reminder, booking),
+                                       reply_markup=markup, parse_mode="HTML")
+                sent_count += 1
+            except (TelegramForbiddenError, TelegramNotFound):
+                # пользователь заблокировал бота — повторять бессмысленно
+                logger.info("Напоминание %s для записи %s не доставлено: бот заблокирован",
+                            reminder.kind, booking["id"])
+            except Exception:
+                logger.exception("Ошибка отправки напоминания %s для записи %s",
+                                 reminder.kind, booking["id"])
+                continue  # попробуем на следующей проверке
+        await db.mark_reminders(booking["id"], to_mark)
+    return sent_count
+
+
+async def reminders_loop() -> None:
+    while True:
+        try:
+            await send_due_reminders(now_local())
+        except Exception:
+            logger.exception("Ошибка в цикле напоминаний")
+        await asyncio.sleep(REMINDER_CHECK_SECONDS)
+
+
+@dp.callback_query(F.data.startswith("rok:"))
+async def on_reminder_ok(callback: types.CallbackQuery):
+    try:
+        booking_id = int(callback.data.split(":")[1])
+    except ValueError:
+        await callback.answer()
+        return
+    booking = await db.confirm_booking(booking_id, callback.from_user.id)
+    if booking is None:
+        await callback.answer("Эта запись уже отменена", show_alert=True)
+        await show(callback, "Эта запись уже отменена.", inline([btn("📅 Записаться", "book")]))
+        return
+    await callback.answer("Спасибо!")
+    await show(
+        callback,
+        "✅ <b>Отлично, ждём вас!</b>\n\n"
+        f"{service_label(booking['service'])}\n"
+        f"🗓 {human_date(booking['date'])}, 🕐 {booking['time']}\n\n"
+        "Мы ещё напомним о визите за 3 часа и за час.",
+    )
+
+
 # ---------------------------------------------------------------- служебное
 @dp.callback_query(F.data == "ignore")
 async def on_ignore(callback: types.CallbackQuery):
@@ -585,11 +669,12 @@ async def main() -> None:
         BotCommand(command="start", description="🏠 Главное меню"),
         BotCommand(command="help", description="ℹ️ Помощь"),
     ])
-    refresher = asyncio.create_task(slots_refresher())
+    background = [asyncio.create_task(slots_refresher()), asyncio.create_task(reminders_loop())]
     try:
         await dp.start_polling(bot)
     finally:
-        refresher.cancel()
+        for task in background:
+            task.cancel()
 
 
 if __name__ == "__main__":

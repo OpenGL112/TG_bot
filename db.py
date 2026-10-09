@@ -55,6 +55,19 @@ async def init_db() -> None:
                 )
             """)
 
+        # Миграция: колонки для напоминаний
+        async with conn.execute("PRAGMA table_info(bookings)") as cur:
+            columns = {row[1] for row in await cur.fetchall()}
+        for column, ddl in (
+            ("created_at", "TEXT"),
+            ("reminded_day", "INTEGER NOT NULL DEFAULT 0"),
+            ("reminded_3h", "INTEGER NOT NULL DEFAULT 0"),
+            ("reminded_1h", "INTEGER NOT NULL DEFAULT 0"),
+            ("confirmed", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in columns:
+                await conn.execute(f"ALTER TABLE bookings ADD COLUMN {column} {ddl}")
+
         # Удаляем дубли слотов (оставляем занятый, иначе с меньшим id) перед созданием UNIQUE-индекса
         await conn.execute("""
             DELETE FROM slots
@@ -167,11 +180,16 @@ async def book_slot(slot_id: int, user_id: int, now: datetime) -> dict | None:
         async with conn.execute("SELECT service, date, time FROM slots WHERE id = ?", (slot_id,)) as c:
             service, day, slot_time = await c.fetchone()
         await conn.execute(
-            "INSERT INTO bookings (user_id, service, date, time, slot_id) VALUES (?, ?, ?, ?, ?)",
-            (user_id, service, day, slot_time, slot_id),
+            """
+            INSERT INTO bookings (user_id, service, date, time, slot_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, service, day, slot_time, slot_id, now.strftime("%Y-%m-%d %H:%M:%S")),
         )
+        async with conn.execute("SELECT last_insert_rowid()") as c:
+            booking_id = (await c.fetchone())[0]
         await conn.commit()
-        return {"service": service, "date": day, "time": slot_time}
+        return {"id": booking_id, "service": service, "date": day, "time": slot_time}
     except Exception:
         await conn.rollback()
         raise
@@ -293,3 +311,65 @@ async def get_booking(booking_id: int, user_id: int) -> dict | None:
         return {"service": row[0], "date": row[1], "time": row[2]} if row else None
     finally:
         await conn.close()
+
+
+REMINDER_KINDS = ("day", "3h", "1h")
+
+
+async def get_bookings_for_reminders(now: datetime, horizon: timedelta) -> list[dict]:
+    """Будущие записи в пределах horizon, по которым ещё не все напоминания обработаны."""
+    now_s = now.strftime("%Y-%m-%d %H:%M")
+    until_s = (now + horizon).strftime("%Y-%m-%d %H:%M")
+    conn = await _connect()
+    try:
+        async with conn.execute(
+            """
+            SELECT id, user_id, service, date, time, created_at,
+                   reminded_day, reminded_3h, reminded_1h
+            FROM bookings
+            WHERE date || ' ' || time > ? AND date || ' ' || time <= ?
+              AND (reminded_day = 0 OR reminded_3h = 0 OR reminded_1h = 0)
+            ORDER BY date, time
+            """,
+            (now_s, until_s),
+        ) as cur:
+            rows = await cur.fetchall()
+    finally:
+        await conn.close()
+    result = []
+    for r in rows:
+        result.append({
+            "id": r[0], "user_id": r[1], "service": r[2], "date": r[3], "time": r[4],
+            "start": datetime.strptime(f"{r[3]} {r[4]}", "%Y-%m-%d %H:%M"),
+            "created_at": datetime.strptime(r[5], "%Y-%m-%d %H:%M:%S") if r[5] else None,
+            "sent": {k for k, flag in zip(REMINDER_KINDS, r[6:9]) if flag},
+        })
+    return result
+
+
+async def mark_reminders(booking_id: int, kinds: set[str]) -> None:
+    kinds = {k for k in kinds if k in REMINDER_KINDS}  # имена колонок только из белого списка
+    if not kinds:
+        return
+    assignments = ", ".join(f"reminded_{k} = 1" for k in sorted(kinds))
+    conn = await _connect()
+    try:
+        await conn.execute(f"UPDATE bookings SET {assignments} WHERE id = ?", (booking_id,))
+        await conn.commit()
+    finally:
+        await conn.close()
+
+
+async def confirm_booking(booking_id: int, user_id: int) -> dict | None:
+    """Клиент нажал «Приду». Возвращает запись или None, если её нет / чужая."""
+    conn = await _connect()
+    try:
+        cur = await conn.execute(
+            "UPDATE bookings SET confirmed = 1 WHERE id = ? AND user_id = ?", (booking_id, user_id)
+        )
+        await conn.commit()
+        if cur.rowcount != 1:
+            return None
+    finally:
+        await conn.close()
+    return await get_booking(booking_id, user_id)
