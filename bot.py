@@ -58,6 +58,8 @@ SALON_NAME = os.getenv("SALON_NAME", "наш салон").strip()
 SALON_URL = os.getenv("SALON_URL", "").strip()
 SALON_PHONE = os.getenv("SALON_PHONE", "").strip()
 SALON_ADDRESS = os.getenv("SALON_ADDRESS", "").strip()
+# db импортируется до load_dotenv, поэтому путь из .env применяем здесь
+db.DATABASE = os.getenv("DATABASE_PATH") or db.DATABASE
 
 MONTHS_RU = ["", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
              "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]

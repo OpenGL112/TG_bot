@@ -1,12 +1,14 @@
 """Работа с базой данных записей (SQLite)."""
 import logging
+import os
 from datetime import date, datetime, time, timedelta
 
 import aiosqlite
 
 logger = logging.getLogger(__name__)
 
-DATABASE = "appointments.db"
+# Путь к файлу базы. В контейнере его стоит направить в папку, которая сохраняется между деплоями.
+DATABASE = os.getenv("DATABASE_PATH") or "appointments.db"
 
 SERVICES = ["Стрижка", "Окрашивание", "Укладка"]
 
@@ -19,6 +21,9 @@ async def _connect() -> aiosqlite.Connection:
 
 async def init_db() -> None:
     """Создаёт таблицы и мигрирует старую схему (bookings без slot_id)."""
+    folder = os.path.dirname(os.path.abspath(DATABASE))
+    os.makedirs(folder, exist_ok=True)
+    logger.info("База данных: %s", os.path.abspath(DATABASE))
     conn = await _connect()
     try:
         await conn.execute("""
