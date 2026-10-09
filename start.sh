@@ -1,2 +1,4 @@
-#!/bin/bash
-python bot.py
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+exec python bot.py

@@ -1,343 +1,441 @@
-from email import message
-from http.client import responses
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+"""Telegram-бот записи на услуги салона (aiogram 3)."""
+import asyncio
+import html
+import logging
+import os
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
+
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from datetime import datetime
-from calendar import monthcalendar, month_name
+from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from calendar import monthcalendar
 from dotenv import load_dotenv
-import asyncio
-import db, re
-from db import cancel_slot
+
+import db
 
 load_dotenv()
-API_TOKEN = "7062809410:AAFy6p7oSkNF11FDC7sa7fXmfCIrxbIlcBM"
-ADMIN_ID = int("308099810")
 
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("bot")
+
+
+# ---------------------------------------------------------------- конфигурация
+def _require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} is not set in the environment (см. .env.example)")
+    return value
+
+
+API_TOKEN = _require_env("BOT_TOKEN")
+ADMIN_ID = int(_require_env("ADMIN_ID"))
+TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Minsk"))
+WORK_START = time.fromisoformat(os.getenv("WORK_START", "09:00"))
+WORK_END = time.fromisoformat(os.getenv("WORK_END", "18:00"))
+SLOT_MINUTES = int(os.getenv("SLOT_MINUTES", "30"))
+WORK_DAYS = {int(d) for d in os.getenv("WORK_DAYS", "0,1,2,3,4,5,6").split(",") if d.strip()}
+BOOKING_DAYS_AHEAD = int(os.getenv("BOOKING_DAYS_AHEAD", "30"))
+SALON_URL = os.getenv("SALON_URL", "").strip()
+
+MONTHS_RU = [
+    "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 bot = Bot(token=API_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 
-# FSM для управления шагами
 class Booking(StatesGroup):
     choosing_service = State()
-    refining_service = State()
     choosing_date = State()
     choosing_time = State()
-    main_menu = State()
 
-# Функция для генерации календаря
-def generate_calendar(year: int, month: int) -> InlineKeyboardMarkup:
-    current_date = datetime.now().date()  # Текущая дата
-    calendar = monthcalendar(year, month)
-    keyboard = []
 
-    # Заголовок календаря
-    header_row = [
-        InlineKeyboardButton(
-            text=f"{month_name[month]} {year}",
-            callback_data="ignore"
-        )
+def now_local() -> datetime:
+    """Текущее время в таймзоне салона (naive, для сравнения со строками в БД)."""
+    return datetime.now(TZ).replace(tzinfo=None)
+
+
+def fmt_date(iso_date: str) -> str:
+    return datetime.strptime(iso_date, "%Y-%m-%d").strftime("%d.%m.%Y")
+
+
+def btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+async def show_or_edit(event: types.Message | types.CallbackQuery, text: str,
+                       markup: InlineKeyboardMarkup | None = None, parse_mode: str | None = None) -> None:
+    """Для callback редактирует текущее сообщение, для команды отправляет новое."""
+    if isinstance(event, types.CallbackQuery):
+        try:
+            await event.message.edit_text(text, reply_markup=markup, parse_mode=parse_mode)
+            return
+        except Exception:  # сообщение слишком старое/не изменилось — отправим новое
+            pass
+        await event.message.answer(text, reply_markup=markup, parse_mode=parse_mode)
+    else:
+        await event.answer(text, reply_markup=markup, parse_mode=parse_mode)
+
+
+# ---------------------------------------------------------------- главное меню
+def main_menu_markup() -> InlineKeyboardMarkup:
+    rows = [
+        [btn("Записаться", "menu:services")],
+        [btn("Мои записи", "menu:my")],
+        [btn("Отменить запись", "menu:cancel")],
     ]
-    keyboard.append(header_row)
+    if SALON_URL:
+        rows.append([InlineKeyboardButton(text="Наш сайт", url=SALON_URL)])
+    rows.append([btn("Выход", "menu:exit")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    # Дни недели
-    header = [
-        InlineKeyboardButton(text="Пн", callback_data="ignore"),
-        InlineKeyboardButton(text="Вт", callback_data="ignore"),
-        InlineKeyboardButton(text="Ср", callback_data="ignore"),
-        InlineKeyboardButton(text="Чт", callback_data="ignore"),
-        InlineKeyboardButton(text="Пт", callback_data="ignore"),
-        InlineKeyboardButton(text="Сб", callback_data="ignore"),
-        InlineKeyboardButton(text="Вс", callback_data="ignore"),
-    ]
-    keyboard.append(header)
 
-    # Дни месяца
-    for week in calendar:
-        week_buttons = []
-        for day in week:
-            if day == 0:  # Пустые дни
-                week_buttons.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
-            else:
-                date = datetime(year, month, day).date()
-                if date < current_date:
-                    # Дата в прошлом: неактивная кнопка
-                    week_buttons.append(InlineKeyboardButton(text=f"🔒 {day}", callback_data="ignore"))
-                else:
-                    # Дата доступна для выбора
-                    week_buttons.append(InlineKeyboardButton(text=str(day), callback_data=f"date_{year}_{month}_{day}"))
-        keyboard.append(week_buttons)
+async def show_main_menu(event: types.Message | types.CallbackQuery, state: FSMContext,
+                         prefix: str = "") -> None:
+    await state.clear()
+    await show_or_edit(event, f"{prefix}Главное меню:", main_menu_markup())
 
-    # Навигация
-    navigation = [
-        InlineKeyboardButton(text="<", callback_data=f"prev_1_{year}_{month}"),
-        InlineKeyboardButton(text=">", callback_data=f"next_1_{year}_{month}"),
-    ]
-    keyboard.append(navigation)
 
-    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await show_main_menu(message, state)
 
-@dp.callback_query(F.data.startswith("next_1_"))
-async def handle_next_1(callback_query: types.CallbackQuery):
-    _, year, month = map(int, callback_query.data.split("_")[1:])
-    month += 1
-    if month > 12:
-        year += month // 12
-        month = month % 12
-    calendar = generate_calendar(year, month)
-    await callback_query.message.edit_reply_markup(reply_markup=calendar)
 
-@dp.callback_query(F.data.startswith("prev_1_"))
-async def handle_prev_1(callback_query: types.CallbackQuery):
-    _, year, month = map(int, callback_query.data.split("_")[1:])
-    month -= 1
-    if month < 1:
-        month = 12
-        year -= 1
-    calendar = generate_calendar(year, month)
-    await callback_query.message.edit_reply_markup(reply_markup=calendar)
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "/start — запись на услугу\n"
+        "/my_bookings — ваши последние записи\n"
+        "/cancel_bookings — отмена предстоящих записей\n"
+        "/help — эта справка"
+    )
 
-# Генерация главного меню
-async def show_start_menu(message_or_callback, state: FSMContext):
-    services = ["Услуги", "Мои записи", "Отменить запись"]
-    builder = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=service, callback_data=f"service_{service}")] for service in services
-    ])
-    builder.inline_keyboard.append([InlineKeyboardButton(text="Ссылка", url = "https://www.google.com")])
-    builder.inline_keyboard.append([InlineKeyboardButton(text="Выход", callback_data="exit")])
 
-    if isinstance(message_or_callback, types.Message):
-        await message_or_callback.answer("Сервисы:", reply_markup=builder)
-    elif isinstance(message_or_callback, types.CallbackQuery):
-        await message_or_callback.message.delete()
-        await message_or_callback.message.answer("Сервисы:", reply_markup=builder)
+@dp.callback_query(F.data == "menu:exit")
+async def on_exit(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await show_or_edit(callback, "До встречи! Чтобы начать снова, нажмите /start")
 
+
+@dp.callback_query(F.data == "menu:main")
+async def on_main(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await show_main_menu(callback, state)
+
+
+# ---------------------------------------------------------------- выбор услуги
+@dp.callback_query(F.data == "menu:services")
+async def on_services(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    rows = [[btn(name, f"svc:{i}")] for i, name in enumerate(db.SERVICES)]
+    rows.append([btn("« Назад", "menu:main")])
+    await show_or_edit(callback, "Выберите услугу:", InlineKeyboardMarkup(inline_keyboard=rows))
     await state.set_state(Booking.choosing_service)
 
 
-# Обработка выхода
-@dp.callback_query(F.data == "exit")
-async def handle_exit(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.message.answer("Сессия завершена. Возвращаемся в главное меню.")
-    await state.clear()
-    await show_start_menu(callback_query, state)
-
-
-# Команда /start
-@dp.message(Command("start"))
-async def start(message: types.Message, state: FSMContext):
-    await show_start_menu(message, state)
-
-
-# Обработка выбора услуги
-@dp.callback_query(F.data.startswith("service_"))
-async def handle_service(callback_query: types.CallbackQuery, state: FSMContext):
-    service = callback_query.data.split("_")[1]
+@dp.callback_query(Booking.choosing_service, F.data.startswith("svc:"))
+async def on_service_chosen(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    try:
+        service = db.SERVICES[int(callback.data.split(":")[1])]
+    except (ValueError, IndexError):
+        await show_main_menu(callback, state, "Неизвестная услуга.\n")
+        return
     await state.update_data(service=service)
+    await state.set_state(Booking.choosing_date)
+    today = now_local()
+    await show_calendar(callback, service, today.year, today.month)
 
-    if service == "Услуги":
-        options = ["Стрижка", "Окрашивание", "Укладка", "Назад"]
-        builder = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=option, callback_data=f"refine_{option}")]
-            for option in options
-        ])
-        await callback_query.message.edit_text("Выберите услугу:", reply_markup=builder)
-        await state.set_state(Booking.refining_service)
 
-    if service == "Мои записи":
-        user_id = callback_query.from_user.id  # Получаем user_id из callback_query
-        await my_bookings(callback_query.message,user_id)
-        await callback_query.answer()  # Ответ на callback, чтобы Telegram не показал ошибку
-    elif service == "Отменить запись":
-        user_id = callback_query.from_user.id  # Получаем user_id из callback_query
-        await cancel_bookings(callback_query.message, user_id)
-    elif service == "Ссылка":
-        await show_help(callback_query.message)
+# ---------------------------------------------------------------- календарь
+def _month_bounds() -> tuple[tuple[int, int], tuple[int, int]]:
+    """Первый и последний месяцы, доступные для навигации."""
+    today = now_local().date()
+    last = today + timedelta(days=BOOKING_DAYS_AHEAD - 1)
+    return (today.year, today.month), (last.year, last.month)
+
+
+async def generate_calendar(service: str, year: int, month: int) -> InlineKeyboardMarkup:
+    now = now_local()
+    today = now.date()
+    free_days = await db.get_days_with_free_slots(service, year, month, now)
+
+    keyboard = [
+        [btn(f"{MONTHS_RU[month]} {year}", "ignore")],
+        [btn(d, "ignore") for d in WEEKDAYS_RU],
+    ]
+    for week in monthcalendar(year, month):
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(btn(" ", "ignore"))
+            elif datetime(year, month, day).date() < today:
+                row.append(btn("🔒", "ignore"))
+            elif day in free_days:
+                row.append(btn(str(day), f"day:{year}:{month}:{day}"))
+            else:
+                row.append(btn("✖", "ignore"))
+        keyboard.append(row)
+
+    first, last = _month_bounds()
+    nav = []
+    nav.append(btn("‹", f"cal:{year}:{month}:prev") if (year, month) > first else btn(" ", "ignore"))
+    nav.append(btn("›", f"cal:{year}:{month}:next") if (year, month) < last else btn(" ", "ignore"))
+    keyboard.append(nav)
+    keyboard.append([btn("« К услугам", "menu:services"), btn("Отмена", "menu:main")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+async def show_calendar(event: types.CallbackQuery, service: str, year: int, month: int) -> None:
+    markup = await generate_calendar(service, year, month)
+    await show_or_edit(
+        event,
+        f"Услуга: {service}\nВыберите дату (✖ — нет свободного времени):",
+        markup,
+    )
+
+
+@dp.callback_query(Booking.choosing_date, F.data.startswith("cal:"))
+async def on_calendar_nav(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    _, year_s, month_s, direction = callback.data.split(":")
+    year, month = int(year_s), int(month_s)
+    if direction == "next":
+        year, month = (year + 1, 1) if month == 12 else (year, month + 1)
     else:
-        pass
+        year, month = (year - 1, 12) if month == 1 else (year, month - 1)
 
-# Уточнение услуги
-@dp.callback_query(F.data.startswith("refine_"))
-async def handle_refine_service(callback_query: types.CallbackQuery, state: FSMContext):
-    refinement = callback_query.data.split("_")[1]
-
-    if refinement == "Назад":
-        await show_start_menu(callback_query, state)
-    else:
-        pass
-        await state.update_data(refinement=refinement)
-        today = datetime.now()
-        calendar = generate_calendar(today.year, today.month)
-        await callback_query.message.answer("Выберите дату:", reply_markup=calendar)
-        await state.set_state(Booking.choosing_date)
-
-
-# Обработка выбора даты
-@dp.callback_query(F.data.startswith("date_"))
-async def handle_date(callback_query: types.CallbackQuery, state: FSMContext):
-    _, year, month, day = callback_query.data.split("_")
-    selected_date = f"{year}-{str(month).zfill(2)}-{str(day).zfill(2)}"
-    await state.update_data(date=selected_date)
-
+    first, last = _month_bounds()
+    if not first <= (year, month) <= last:
+        return
     data = await state.get_data()
-    service = data["refinement"]
-    # Получаем доступные слоты
-    available_slots = await db.get_available_slots(service, selected_date)
-    if not available_slots:
-        await callback_query.message.answer("На выбранную дату нет доступных слотов. Выберите другую дату.")
+    await show_calendar(callback, data["service"], year, month)
+
+
+@dp.callback_query(Booking.choosing_date, F.data.startswith("day:"))
+async def on_day_chosen(callback: types.CallbackQuery, state: FSMContext):
+    _, year, month, day = callback.data.split(":")
+    selected = datetime(int(year), int(month), int(day)).date()
+    if selected < now_local().date():
+        await callback.answer("Эта дата уже прошла", show_alert=True)
         return
 
-    # Генерация клавиатуры для выбора времени
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{time}", callback_data=f"slot_{slot_id}")]
-        for slot_id, time in available_slots
-    ])
-    keyboard.inline_keyboard.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
+    data = await state.get_data()
+    service = data["service"]
+    slots = await db.get_available_slots(service, selected.isoformat(), now_local())
+    if not slots:
+        await callback.answer("На эту дату свободного времени нет", show_alert=True)
+        await show_calendar(callback, service, selected.year, selected.month)
+        return
 
-    await callback_query.message.answer("Выберите время:", reply_markup=keyboard)
+    await callback.answer()
+    await state.update_data(date=selected.isoformat())
     await state.set_state(Booking.choosing_time)
 
-
-# Кнопка "Отмена"
-@dp.callback_query(F.data == "cancel")
-async def handle_cancel(callback_query: types.CallbackQuery, state: FSMContext):
-    await callback_query.message.answer("Действие отменено. Возвращаемся в меню.")
-    await state.clear()
-    await show_start_menu(callback_query, state)
-
-# Обработка команды /help
-@dp.message(Command("help"))
-async def show_help(message: types.Message):
-    help_text = (
-        "/start - запуск бота для записи\n"
-        "/help - описание доступных функций\n"
-        "/my_bookings - возвращает последнее бронирование"
+    # по 4 кнопки в ряд, чтобы список не растягивался на весь экран
+    rows = [
+        [btn(t, f"slot:{slot_id}") for slot_id, t in slots[i:i + 4]]
+        for i in range(0, len(slots), 4)
+    ]
+    rows.append([btn("« К календарю", f"back_cal:{selected.year}:{selected.month}"),
+                 btn("Отмена", "menu:main")])
+    await show_or_edit(
+        callback,
+        f"Услуга: {service}\nДата: {selected.strftime('%d.%m.%Y')}\nВыберите время:",
+        InlineKeyboardMarkup(inline_keyboard=rows),
     )
-    await message.answer(help_text)
 
 
-# Команда /my_bookings
-@dp.message(Command("my_bookings"))
-async def my_bookings(message: types.Message, user_id):
-
-    last_bookings = await db.get_last_bookings(user_id, limit=3)
-
-    if not last_bookings:
-        await message.answer("У вас нет недавних бронирований.")
-        return
-
-    response = "Ваши бронирования:\n\n"
-    for booking in last_bookings:
-        # Обращаемся к элементам через индексы, если это кортеж
-        response += (
-            f"Услуга: {booking[0]}\n"  # service
-            f"Дата: {booking[1]}\n"    # date
-            f"Время: {booking[2]}\n\n" # time
-        )
-
-    await message.answer(response)
-
-
-# Команда /cancel_bookings
-@dp.message(Command("cancel_bookings"))
-async def cancel_bookings(message: types.Message, user_id):
-
-    counter = 0
-    # Получаем последние бронирования пользователя
-    last_bookings = await db.get_last_bookings(user_id, limit=3)
-    d = datetime.today()
-
-    # Если бронирований нет
-    if not last_bookings:
-        await message.answer("У вас нет активных бронирований.")
-        return
-
-    # Формируем ответ
-    responses = []
-    slot_response_id = []
-    has_active_bookings = False  # Флаг для проверки наличия активных бронирований
-
-    for booking in last_bookings:
-        booking_date = datetime.strptime(booking[1], '%Y-%m-%d').date()
-
-        if booking_date >= d.date():  # Проверяем, актуально ли бронирование
-            has_active_bookings = True
-            counter += 1
-            responses += [
-                f"Услуга: {booking[0]}\n"  # service
-                f"Дата: {booking[1]}\n"  # date
-                f"Время: {booking[2]}\n"  # time
-            ]
-            slot_response_id += [booking[3]] # ID
-
-    # Если есть активные бронирования, отправляем список
-    if has_active_bookings:
-        t = 0
-        await message.answer(text = 'Какое бронирование Вы хотите отменить?\n\n')
-        for response in responses:
-            cancel_list = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text='Отмена', callback_data=f"db_cancel_booking_{slot_response_id[t]}")]])
-            t+=1
-            await message.answer(text=response, reply_markup=cancel_list)
-    else:
-        await message.answer("У вас нет активных бронирований.")
-
-#Отмена бронирования
-@dp.callback_query(F.data.startswith("db_cancel_booking"))
-async def handle_db_cancel_booking (callback_query: types.CallbackQuery, state: FSMContext):
-    slot_id = callback_query.data[len("db_cancel_booking_"):]  # Получаем строку с метаданными
-    user_id = callback_query.from_user.id
-    final = await db.cancel_slot(slot_id, user_id)
-    await callback_query.message.answer(final)
-    await show_start_menu(callback_query, state)
-
-# Завершение бронирования
-@dp.callback_query(F.data.startswith("slot_"))
-async def handle_time_and_finish(callback_query: types.CallbackQuery, state: FSMContext):
-    slot_id = int(callback_query.data.split("_")[1])
-    user_id = callback_query.from_user.id  # Получаем user_id из callback_query
-    slot_time = await db.book_slot(slot_id, user_id)  # Вызываем функцию бронирования
-
+@dp.callback_query(Booking.choosing_time, F.data.startswith("back_cal:"))
+async def on_back_to_calendar(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    _, year, month = callback.data.split(":")
+    await state.set_state(Booking.choosing_date)
     data = await state.get_data()
-    service = data["refinement"]
-    date = data["date"]
-
-    # Ответ пользователю
-    await callback_query.message.answer(
-        f"Вы успешно записаны на услугу: {service}\nДата: {date}\nВремя: {slot_time}\nСпасибо!"
-    )
-
-    # Ссылка на профиль
-    link = f'<a href="tg://user?id={user_id}">Заказчик</a>'
-
-    # Уведомление администратору
-    await bot.send_message(
-        ADMIN_ID,
-        f"Новая запись:\nУслуга: {service}\nДата: {date}\nВремя: {slot_time}\n"
-        f"Пользователь: {callback_query.from_user.full_name}"
-        f"\nСсылка на профиль: {link}", parse_mode="HTML"
-    )
+    await show_calendar(callback, data["service"], int(year), int(month))
 
 
+# ---------------------------------------------------------------- бронирование
+@dp.callback_query(Booking.choosing_time, F.data.startswith("slot:"))
+async def on_slot_chosen(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        slot_id = int(callback.data.split(":")[1])
+    except ValueError:
+        await callback.answer()
+        return
+
+    booking = await db.book_slot(slot_id, callback.from_user.id, now_local())
+    if booking is None:
+        await callback.answer("Это время уже занято, выберите другое", show_alert=True)
+        data = await state.get_data()
+        selected = datetime.strptime(data["date"], "%Y-%m-%d")
+        await state.set_state(Booking.choosing_date)
+        await show_calendar(callback, data["service"], selected.year, selected.month)
+        return
+
+    await callback.answer("Готово!")
     await state.clear()
-    await show_start_menu(callback_query, state)
+    await show_or_edit(
+        callback,
+        f"✅ Вы записаны!\n\nУслуга: {booking['service']}\n"
+        f"Дата: {fmt_date(booking['date'])}\nВремя: {booking['time']}\n\nСпасибо!",
+    )
+    await notify_admin(
+        "Новая запись",
+        booking,
+        callback.from_user,
+    )
+    await callback.message.answer("Главное меню:", reply_markup=main_menu_markup())
 
 
-# Инициализация базы данных
-async def on_startup():
+async def notify_admin(title: str, booking: dict, user: types.User) -> None:
+    """Уведомление администратору. Ошибка отправки не ломает сценарий пользователя."""
+    text = (
+        f"<b>{html.escape(title)}</b>\n"
+        f"Услуга: {html.escape(booking['service'])}\n"
+        f"Дата: {fmt_date(booking['date'])}\n"
+        f"Время: {booking['time']}\n"
+        f"Клиент: <a href=\"tg://user?id={user.id}\">{html.escape(user.full_name)}</a>"
+    )
+    if user.username:
+        text += f" (@{html.escape(user.username)})"
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception:
+        logger.exception("Не удалось отправить уведомление администратору %s", ADMIN_ID)
+
+
+# ---------------------------------------------------------------- мои записи / отмена
+async def send_last_bookings(event: types.Message | types.CallbackQuery, user_id: int) -> None:
+    bookings = await db.get_last_bookings(user_id, limit=3)
+    back = InlineKeyboardMarkup(inline_keyboard=[[btn("« В меню", "menu:main")]])
+    if not bookings:
+        await show_or_edit(event, "У вас нет записей.", back)
+        return
+    lines = ["Ваши последние записи:\n"]
+    for service, day, slot_time, _ in bookings:
+        lines.append(f"• {service} — {fmt_date(day)} в {slot_time}")
+    await show_or_edit(event, "\n".join(lines), back)
+
+
+async def send_cancel_bookings(event: types.Message | types.CallbackQuery, user_id: int) -> None:
+    bookings = await db.get_upcoming_bookings(user_id, now_local())
+    if not bookings:
+        await show_or_edit(
+            event, "У вас нет предстоящих записей.",
+            InlineKeyboardMarkup(inline_keyboard=[[btn("« В меню", "menu:main")]]),
+        )
+        return
+    rows = [
+        [btn(f"❌ {service}, {fmt_date(day)} {slot_time}", f"bcancel:{booking_id}")]
+        for service, day, slot_time, booking_id in bookings
+    ]
+    rows.append([btn("« В меню", "menu:main")])
+    await show_or_edit(event, "Какую запись отменить?", InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data == "menu:my")
+async def on_my(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await send_last_bookings(callback, callback.from_user.id)
+
+
+@dp.callback_query(F.data == "menu:cancel")
+async def on_cancel_menu(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await send_cancel_bookings(callback, callback.from_user.id)
+
+
+@dp.message(Command("my_bookings"))
+async def cmd_my_bookings(message: types.Message):
+    await send_last_bookings(message, message.from_user.id)
+
+
+@dp.message(Command("cancel_bookings"))
+async def cmd_cancel_bookings(message: types.Message):
+    await send_cancel_bookings(message, message.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("bcancel:"))
+async def on_booking_cancel(callback: types.CallbackQuery, state: FSMContext):
+    try:
+        booking_id = int(callback.data.split(":")[1])
+    except ValueError:
+        await callback.answer()
+        return
+    cancelled = await db.cancel_booking(booking_id, callback.from_user.id)
+    if cancelled is None:
+        await callback.answer("Запись не найдена", show_alert=True)
+    else:
+        await callback.answer("Запись отменена")
+        await notify_admin("Запись отменена", cancelled, callback.from_user)
+    await send_cancel_bookings(callback, callback.from_user.id)
+
+
+# ---------------------------------------------------------------- служебное
+@dp.callback_query(F.data == "ignore")
+async def on_ignore(callback: types.CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query()
+async def on_stale_callback(callback: types.CallbackQuery, state: FSMContext):
+    """Кнопки из старых сообщений (например, после перезапуска бота)."""
+    await callback.answer("Это меню устарело, начните заново", show_alert=False)
+    await show_main_menu(callback, state)
+
+
+async def refresh_slots() -> None:
+    added = await db.ensure_slots(
+        start=now_local().date(),
+        days=BOOKING_DAYS_AHEAD,
+        work_start=WORK_START,
+        work_end=WORK_END,
+        step_minutes=SLOT_MINUTES,
+        work_days=WORK_DAYS,
+    )
+    if added:
+        logger.info("Добавлено слотов: %s", added)
+
+
+async def slots_refresher() -> None:
+    """Раз в сутки дополняет расписание, чтобы окно записи всегда было BOOKING_DAYS_AHEAD дней."""
+    while True:
+        await asyncio.sleep(24 * 60 * 60)
+        try:
+            await refresh_slots()
+        except Exception:
+            logger.exception("Ошибка при обновлении слотов")
+
+
+async def main() -> None:
     await db.init_db()
-
-
-# Запуск бота
-async def main():
-    await dp.start_polling(bot)
+    await refresh_slots()
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Записаться на услугу"),
+        BotCommand(command="my_bookings", description="Мои записи"),
+        BotCommand(command="cancel_bookings", description="Отменить запись"),
+        BotCommand(command="help", description="Справка"),
+    ])
+    refresher = asyncio.create_task(slots_refresher())
+    try:
+        await dp.start_polling(bot)
+    finally:
+        refresher.cancel()
 
 
 if __name__ == "__main__":
-    asyncio.run(on_startup())
     asyncio.run(main())
